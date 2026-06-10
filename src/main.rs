@@ -11,6 +11,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,6 +77,16 @@ struct CommonArgs {
     terminate_command: Option<String>,
     #[arg(long)]
     leave_running_on_stall: bool,
+    /// pgrep -f pattern; as soon as a process matches, attach `strace -f` to it
+    /// (writes rpctrace.log). Detached + flushed before any gdb capture.
+    #[arg(long)]
+    attach_strace: Option<String>,
+    #[arg(long, default_value = "sendmsg,recvmsg")]
+    attach_strace_expr: String,
+    #[arg(long, default_value_t = 64)]
+    attach_strace_str: usize,
+    #[arg(long, default_value_t = 50)]
+    attach_strace_poll_ms: u64,
     #[arg(last = true, required = true)]
     command: Vec<String>,
 }
@@ -375,6 +387,95 @@ fn terminate_group(child: &Child) {
     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
 }
 
+struct StraceAttacher {
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl StraceAttacher {
+    /// Poll for the earliest process matching `pattern` and attach `strace -f`
+    /// to it, logging the configured syscalls to `bundle/rpctrace.log`.
+    fn spawn(
+        pattern: String,
+        expr: String,
+        str_len: usize,
+        poll: Duration,
+        deadline: Instant,
+        bundle: PathBuf,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let stop_t = stop.clone();
+        let child_t = child.clone();
+        let handle = thread::spawn(move || {
+            let self_pid = std::process::id();
+            let log = bundle.join("rpctrace.log");
+            let status = bundle.join("attach-strace.txt");
+            while !stop_t.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let found = Command::new("pgrep")
+                    .args(["-f", &pattern])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .filter_map(|line| line.trim().parse::<u32>().ok())
+                            .find(|pid| *pid != self_pid)
+                    });
+                if let Some(pid) = found {
+                    let mut command = Command::new("strace");
+                    command
+                        .args([
+                            "-f",
+                            "-ttt",
+                            "-yy",
+                            "-e",
+                            &format!("trace={expr}"),
+                            "-s",
+                            &str_len.to_string(),
+                            "-p",
+                            &pid.to_string(),
+                            "-o",
+                        ])
+                        .arg(&log);
+                    match command.spawn() {
+                        Ok(handle) => {
+                            let _ = fs::write(
+                                &status,
+                                format!("attached target_pid={pid} strace_pid={}\n", handle.id()),
+                            );
+                            *child_t.lock().unwrap() = Some(handle);
+                        }
+                        Err(error) => {
+                            let _ = fs::write(&status, format!("strace spawn failed: {error}\n"));
+                        }
+                    }
+                    return;
+                }
+                thread::sleep(poll);
+            }
+            let _ = fs::write(&status, "target never appeared before deadline\n");
+        });
+        Self {
+            stop,
+            child,
+            handle,
+        }
+    }
+
+    /// Stop polling and detach strace via SIGINT so it flushes its log cleanly.
+    /// Must run before any gdb capture (a process can only have one tracer).
+    fn detach(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGINT);
+            let _ = child.wait();
+        }
+        let _ = self.handle.join();
+    }
+}
+
 fn spawn(
     args: &CommonArgs,
     bundle: &Path,
@@ -423,6 +524,16 @@ fn run_experiment(
     let stdout = bundle.join("stdout.log");
     let stderr = bundle.join("stderr.log");
     let deadline = Instant::now() + Duration::from_secs(args.timeout_seconds);
+    let strace = args.attach_strace.as_ref().map(|pattern| {
+        StraceAttacher::spawn(
+            pattern.clone(),
+            args.attach_strace_expr.clone(),
+            args.attach_strace_str,
+            Duration::from_millis(args.attach_strace_poll_ms),
+            deadline,
+            bundle.clone(),
+        )
+    });
     let result;
 
     loop {
@@ -446,6 +557,12 @@ fn run_experiment(
             break;
         }
         thread::sleep(Duration::from_secs(args.poll_seconds));
+    }
+
+    // Detach strace (flushing rpctrace.log) before any gdb capture: a process
+    // can only have a single tracer at a time.
+    if let Some(strace) = strace {
+        strace.detach();
     }
 
     if !matches!(result, "exited" | "failed") {
