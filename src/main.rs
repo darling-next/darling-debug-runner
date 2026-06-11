@@ -239,10 +239,10 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
 
 fn expand_home(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
-    if text == "~" || text.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(text.trim_start_matches("~/"));
-        }
+    if (text == "~" || text.starts_with("~/"))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(text.trim_start_matches("~/"));
     }
     path.to_owned()
 }
@@ -360,6 +360,7 @@ fn process_tree(root: u32) -> Vec<u32> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_process_tree(
     root: u32,
     bundle: &Path,
@@ -413,6 +414,7 @@ fn capture_process_tree(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_target(
     pid: u32,
     bundle: &Path,
