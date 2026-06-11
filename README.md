@@ -21,6 +21,12 @@ target/release/darling-debug-runner capture \
   --gdb-executable ~/work/darling-build/src/external/darlingserver/darlingserver
 ```
 
+Add `--tree` to capture the matched process and all of its descendants. During
+`run` or `darling`, combine `--capture-gdb --capture-tree` to do the same on a
+timeout or detected stall. Add `--gdb-namespace` when the target runs in a
+nested PID namespace; the runner will also attach GDB using the target's
+namespace-local PID.
+
 Run a command with a hard timeout:
 
 ```sh

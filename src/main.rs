@@ -5,7 +5,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpgid};
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
@@ -59,6 +59,11 @@ struct CommonArgs {
     prepare_command: Option<String>,
     #[arg(long)]
     capture_gdb: bool,
+    #[arg(long)]
+    capture_tree: bool,
+    /// Also capture GDB from inside the target's PID namespace.
+    #[arg(long)]
+    gdb_namespace: bool,
     #[arg(long)]
     gdb_executable: Option<PathBuf>,
     #[arg(long)]
@@ -121,6 +126,11 @@ struct CaptureArgs {
     name: String,
     #[arg(long)]
     gdb: bool,
+    #[arg(long)]
+    tree: bool,
+    /// Also capture GDB from inside the target's PID namespace.
+    #[arg(long)]
+    gdb_namespace: bool,
     #[arg(long)]
     gdb_executable: Option<PathBuf>,
     #[arg(long)]
@@ -288,6 +298,23 @@ fn find_pid(pid: Option<u32>, pattern: Option<&str>) -> Result<u32> {
         .with_context(|| format!("no process matched {pattern:?}"))
 }
 
+fn find_pid_in_tree(root: u32, pattern: &str) -> Result<u32> {
+    let pattern = Regex::new(pattern).context("invalid process pattern")?;
+    process_tree(root)
+        .into_iter()
+        .filter_map(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .ok()
+                .map(|cmdline| (pid, cmdline))
+        })
+        .filter(|(_, cmdline)| {
+            pattern.is_match(&String::from_utf8_lossy(cmdline).replace('\0', " "))
+        })
+        .min_by_key(|(_, cmdline)| cmdline.len())
+        .map(|(pid, _)| pid)
+        .with_context(|| format!("no process in tree rooted at {root} matched {pattern:?}"))
+}
+
 fn command_to_file(mut command: Command, output: &Path) {
     if let Ok(file) = File::create(output) {
         let _ = command
@@ -297,10 +324,100 @@ fn command_to_file(mut command: Command, output: &Path) {
     }
 }
 
+fn process_tree(root: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let Some(ppid) = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:"))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        result.push(pid);
+        if let Some(descendants) = children.get(&pid) {
+            pending.extend(descendants);
+        }
+    }
+    result
+}
+
+fn capture_process_tree(
+    root: u32,
+    bundle: &Path,
+    gdb: bool,
+    gdb_namespace: bool,
+    gdb_executable: Option<&Path>,
+    gdb_cwd: Option<&Path>,
+    gdb_ex: &[String],
+    snapshots: usize,
+    interval: Duration,
+) -> Result<()> {
+    let pids = process_tree(root);
+    fs::create_dir_all(bundle)?;
+    fs::write(
+        bundle.join("tree-pids.txt"),
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )?;
+
+    let pid_list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut ps = Command::new("ps");
+    ps.args([
+        "-p",
+        &pid_list,
+        "-o",
+        "pid,ppid,pgid,sid,stat,etime,wchan:32,comm,args",
+        "--forest",
+    ]);
+    command_to_file(ps, &bundle.join("ps-tree.txt"));
+
+    for pid in pids {
+        capture_target(
+            pid,
+            &bundle.join(format!("pid-{pid}")),
+            gdb,
+            gdb_namespace,
+            gdb_executable,
+            gdb_cwd,
+            gdb_ex,
+            snapshots,
+            interval,
+        )?;
+    }
+    Ok(())
+}
+
 fn capture_target(
     pid: u32,
     bundle: &Path,
     gdb: bool,
+    gdb_namespace: bool,
     gdb_executable: Option<&Path>,
     gdb_cwd: Option<&Path>,
     gdb_ex: &[String],
@@ -355,32 +472,75 @@ fn capture_target(
             }
         }
         if gdb {
-            let mut command = Command::new("timeout");
-            command.args(["30s", "sudo", "-n", "gdb", "-q"]);
-            if let Some(cwd) = gdb_cwd {
-                command.current_dir(expand_home(cwd));
-            }
-            if let Some(executable) = gdb_executable {
-                command.arg(expand_home(executable));
-            }
-            command.args(["-p", &pid.to_string(), "-batch"]).args([
-                "-ex",
-                "set pagination off",
-                "-ex",
-                "info threads",
-                "-ex",
-                "thread apply all bt full",
-            ]);
-            for expression in gdb_ex {
-                command.args(["-ex", expression]);
-            }
+            let command = gdb_command(pid, None, gdb_executable, gdb_cwd, gdb_ex);
             command_to_file(command, &bundle.join(format!("gdb-{index}.txt")));
+
+            if gdb_namespace {
+                let namespace_pid = namespace_pid(pid).unwrap_or(pid);
+                let command =
+                    gdb_command(namespace_pid, Some(pid), gdb_executable, gdb_cwd, gdb_ex);
+                command_to_file(command, &bundle.join(format!("gdb-namespace-{index}.txt")));
+            }
         }
         if index < snapshots {
             thread::sleep(interval);
         }
     }
     Ok(())
+}
+
+fn namespace_pid(pid: u32) -> Option<u32> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))?
+        .split_whitespace()
+        .next_back()?
+        .parse()
+        .ok()
+}
+
+fn gdb_command(
+    pid: u32,
+    namespace_target: Option<u32>,
+    executable: Option<&Path>,
+    cwd: Option<&Path>,
+    expressions: &[String],
+) -> Command {
+    let mut command = Command::new("timeout");
+    command.args(["30s", "sudo", "-n"]);
+    if let Some(target) = namespace_target {
+        command
+            .args([
+                "nsenter",
+                "--target",
+                &target.to_string(),
+                "--pid",
+                "--mount",
+                "--",
+            ])
+            .args(["gdb", "-q"]);
+    } else {
+        command.args(["gdb", "-q"]);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(expand_home(cwd));
+    }
+    if let Some(executable) = executable {
+        command.arg(expand_home(executable));
+    }
+    command.args(["-p", &pid.to_string(), "-batch"]).args([
+        "-ex",
+        "set pagination off",
+        "-ex",
+        "info threads",
+        "-ex",
+        "thread apply all bt full",
+    ]);
+    for expression in expressions {
+        command.args(["-ex", expression]);
+    }
+    command
 }
 
 fn terminate_group(child: &Child) {
@@ -397,6 +557,7 @@ impl StraceAttacher {
     /// Poll for the earliest process matching `pattern` and attach `strace -f`
     /// to it, logging the configured syscalls to `bundle/rpctrace.log`.
     fn spawn(
+        root_pid: u32,
         pattern: String,
         expr: String,
         str_len: usize,
@@ -409,24 +570,16 @@ impl StraceAttacher {
         let stop_t = stop.clone();
         let child_t = child.clone();
         let handle = thread::spawn(move || {
-            let self_pid = std::process::id();
             let log = bundle.join("rpctrace.log");
             let status = bundle.join("attach-strace.txt");
             while !stop_t.load(Ordering::Relaxed) && Instant::now() < deadline {
-                let found = Command::new("pgrep")
-                    .args(["-f", &pattern])
-                    .output()
-                    .ok()
-                    .and_then(|out| {
-                        String::from_utf8_lossy(&out.stdout)
-                            .lines()
-                            .filter_map(|line| line.trim().parse::<u32>().ok())
-                            .find(|pid| *pid != self_pid)
-                    });
+                let found = find_pid_in_tree(root_pid, &pattern).ok();
                 if let Some(pid) = found {
-                    let mut command = Command::new("strace");
+                    let mut command = Command::new("sudo");
                     command
                         .args([
+                            "-n",
+                            "strace",
                             "-f",
                             "-ttt",
                             "-yy",
@@ -526,6 +679,7 @@ fn run_experiment(
     let deadline = Instant::now() + Duration::from_secs(args.timeout_seconds);
     let strace = args.attach_strace.as_ref().map(|pattern| {
         StraceAttacher::spawn(
+            child.id(),
             pattern.clone(),
             args.attach_strace_expr.clone(),
             args.attach_strace_str,
@@ -571,17 +725,36 @@ fn run_experiment(
             let _ = fs::copy(stall_log, bundle.join("stall-log.txt"));
         }
         if args.capture_gdb {
-            let capture_pid = find_pid(None, args.capture_pattern.as_deref()).unwrap_or(child.id());
-            capture_target(
-                capture_pid,
-                &bundle.join("capture"),
-                true,
-                args.gdb_executable.as_deref(),
-                args.gdb_cwd.as_deref(),
-                &args.gdb_ex,
-                args.capture_snapshots,
-                Duration::from_secs(args.capture_interval_seconds),
-            )?;
+            let capture_pid = args
+                .capture_pattern
+                .as_deref()
+                .and_then(|pattern| find_pid_in_tree(child.id(), pattern).ok())
+                .unwrap_or(child.id());
+            if args.capture_tree {
+                capture_process_tree(
+                    capture_pid,
+                    &bundle.join("capture-tree"),
+                    true,
+                    args.gdb_namespace,
+                    args.gdb_executable.as_deref(),
+                    args.gdb_cwd.as_deref(),
+                    &args.gdb_ex,
+                    args.capture_snapshots,
+                    Duration::from_secs(args.capture_interval_seconds),
+                )?;
+            } else {
+                capture_target(
+                    capture_pid,
+                    &bundle.join("capture"),
+                    true,
+                    args.gdb_namespace,
+                    args.gdb_executable.as_deref(),
+                    args.gdb_cwd.as_deref(),
+                    &args.gdb_ex,
+                    args.capture_snapshots,
+                    Duration::from_secs(args.capture_interval_seconds),
+                )?;
+            }
         }
         if let Some(command) = &args.capture_command {
             shell_hook(command, &bundle, child.id());
@@ -674,16 +847,31 @@ fn main() -> Result<ExitCode> {
         RunnerCommand::Capture(args) => {
             let pid = find_pid(args.pid, args.pattern.as_deref())?;
             let bundle = make_bundle(&args.bundle_root, &args.name)?;
-            capture_target(
-                pid,
-                &bundle,
-                args.gdb,
-                args.gdb_executable.as_deref(),
-                args.gdb_cwd.as_deref(),
-                &args.gdb_ex,
-                args.snapshots,
-                Duration::from_secs(args.interval_seconds),
-            )?;
+            if args.tree {
+                capture_process_tree(
+                    pid,
+                    &bundle,
+                    args.gdb,
+                    args.gdb_namespace,
+                    args.gdb_executable.as_deref(),
+                    args.gdb_cwd.as_deref(),
+                    &args.gdb_ex,
+                    args.snapshots,
+                    Duration::from_secs(args.interval_seconds),
+                )?;
+            } else {
+                capture_target(
+                    pid,
+                    &bundle,
+                    args.gdb,
+                    args.gdb_namespace,
+                    args.gdb_executable.as_deref(),
+                    args.gdb_cwd.as_deref(),
+                    &args.gdb_ex,
+                    args.snapshots,
+                    Duration::from_secs(args.interval_seconds),
+                )?;
+            }
             (bundle, "captured")
         }
         RunnerCommand::Signal(args) => {
