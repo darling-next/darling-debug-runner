@@ -545,8 +545,60 @@ fn gdb_command(
     command
 }
 
-fn terminate_group(child: &Child) {
-    let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
+fn terminate_group(child: &mut Child) -> Result<String> {
+    let pgid = Pid::from_raw(child.id() as i32);
+    let pids = process_tree(child.id());
+    let mut lines = Vec::new();
+
+    match killpg(pgid, Signal::SIGTERM) {
+        Ok(()) => lines.push("sent SIGTERM to process group".to_owned()),
+        Err(error) => lines.push(format!("SIGTERM failed: {error}")),
+    }
+    for pid in &pids {
+        if *pid != std::process::id() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid as i32), Signal::SIGTERM);
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            lines.push(format!("child exited after SIGTERM: {status}"));
+            return Ok(lines.join("\n") + "\n");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    match killpg(pgid, Signal::SIGKILL) {
+        Ok(()) => lines.push("sent SIGKILL to process group".to_owned()),
+        Err(error) => lines.push(format!("SIGKILL failed: {error}")),
+    }
+    for pid in &pids {
+        if *pid != std::process::id() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            lines.push(format!("child exited after SIGKILL: {status}"));
+            return Ok(lines.join("\n") + "\n");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let remaining: Vec<u32> = pids
+        .into_iter()
+        .filter(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        .collect();
+    if remaining.is_empty() {
+        lines.push("process tree gone after SIGKILL; child was not reaped yet".to_owned());
+    } else {
+        lines.push(format!(
+            "processes still alive after SIGKILL: {remaining:?}"
+        ));
+    }
+    Ok(lines.join("\n") + "\n")
 }
 
 struct StraceAttacher {
@@ -670,6 +722,17 @@ fn run_experiment(
         bundle.join("command.txt"),
         format!("{}\n", command.join(" ")),
     )?;
+    let mut env_lines: Vec<String> = std::env::vars()
+        .chain(args.env.iter().cloned())
+        .chain(
+            extra_env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    env_lines.sort();
+    fs::write(bundle.join("env.txt"), env_lines.join("\n") + "\n")?;
     if let Some(command) = &args.prepare_command {
         shell_hook(command, &bundle, 0);
     }
@@ -726,6 +789,17 @@ fn run_experiment(
             let stall_log = expand_home(stall_log);
             let _ = fs::copy(stall_log, bundle.join("stall-log.txt"));
         }
+        let _ = capture_process_tree(
+            child.id(),
+            &bundle.join("guarded-tree"),
+            false,
+            false,
+            None,
+            None,
+            &[],
+            1,
+            Duration::from_secs(0),
+        );
         if args.capture_gdb {
             let capture_pid = args
                 .capture_pattern
@@ -764,8 +838,12 @@ fn run_experiment(
         if result != "stall" || !args.leave_running_on_stall {
             if let Some(command) = &args.terminate_command {
                 shell_hook(command, &bundle, child.id());
+                fs::write(bundle.join("cleanup-status.txt"), "ran terminate-command\n")?;
             } else {
-                terminate_group(&child);
+                fs::write(
+                    bundle.join("cleanup-status.txt"),
+                    terminate_group(&mut child)?,
+                )?;
             }
         }
     }
