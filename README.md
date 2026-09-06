@@ -37,9 +37,9 @@ target/release/darling-debug-runner run \
 ```
 
 The `darling` subcommand gently shuts down the selected prefix before running
-and optionally installs a freshly built `darlingserver`. On timeout or a
-detected stall it uses `darling shutdown` instead of signaling the process
-group.
+and optionally installs a freshly built `darlingserver`. On timeout, detected
+stall, or cancellation it uses `darling shutdown` instead of signaling the
+process group.
 
 Existing stall logs are followed from their current end, so old events do not
 affect a new run. Use `--terminate-command` with `run` when the target has its
@@ -47,3 +47,14 @@ own safe shutdown mechanism.
 
 The runner reports a command that exits unsuccessfully as `RESULT=failed` and
 returns a non-zero status without treating it as a stall.
+
+SIGINT and SIGTERM request cancellation through the runner's normal cleanup
+path and produce `RESULT=cancelled` with a non-zero exit status. Cancellation
+wakes the runner even with a long polling interval and skips GDB/capture hooks
+so the owner can shut down promptly. A configured `--terminate-command` must
+succeed and the managed child must exit before cleanup is reported complete;
+failure is reported without falling back to a process-group kill.
+
+For prefix-backed commands, use `darling` or supply the prefix owner's
+`--terminate-command` explicitly. The generic `run` fallback cannot infer
+dependencies such as guests needing a live RPC server during termination.

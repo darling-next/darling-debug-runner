@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpgid};
 use regex::Regex;
@@ -8,6 +9,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -15,6 +18,60 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+struct Cancellation {
+    reader: UnixStream,
+    signals: [signal_hook::SigId; 2],
+}
+
+impl Cancellation {
+    fn install() -> Result<Self> {
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        let interrupt = signal_hook::low_level::pipe::register(
+            signal_hook::consts::SIGINT,
+            writer.try_clone()?,
+        )?;
+        let terminate =
+            match signal_hook::low_level::pipe::register(signal_hook::consts::SIGTERM, writer) {
+                Ok(id) => id,
+                Err(error) => {
+                    signal_hook::low_level::unregister(interrupt);
+                    return Err(error.into());
+                }
+            };
+        Ok(Self {
+            reader,
+            signals: [interrupt, terminate],
+        })
+    }
+
+    fn requested(&mut self) -> Result<bool> {
+        match self.reader.read(&mut [0]) {
+            Ok(1) => Ok(true),
+            Ok(_) => bail!("cancellation pipe closed"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn wait(&self, seconds: u64) -> Result<()> {
+        let mut fds = [PollFd::new(self.reader.as_fd(), PollFlags::POLLIN)];
+        let timeout = PollTimeout::try_from(Duration::from_secs(seconds))?;
+        match poll(&mut fds, timeout) {
+            Ok(_) | Err(nix::errno::Errno::EINTR) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for Cancellation {
+    fn drop(&mut self) {
+        for id in self.signals {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(about = "Run and capture local or Darling debugging experiments")]
@@ -266,12 +323,12 @@ fn make_bundle(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(bundle)
 }
 
-fn shell_hook(command: &str, bundle: &Path, pid: u32) {
-    let _ = Command::new("/bin/bash")
+fn shell_hook(command: &str, bundle: &Path, pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("/bin/bash")
         .args(["-lc", command])
         .env("BUNDLE", bundle)
         .env("TARGET_PID", pid.to_string())
-        .status();
+        .status()
 }
 
 fn find_pid(pid: Option<u32>, pattern: Option<&str>) -> Result<u32> {
@@ -717,6 +774,7 @@ fn run_experiment(
     command: Vec<String>,
     extra_env: HashMap<String, String>,
 ) -> Result<(PathBuf, &'static str)> {
+    let mut cancellation = Cancellation::install()?;
     let bundle = make_bundle(&args.bundle_root, &args.name)?;
     fs::write(
         bundle.join("command.txt"),
@@ -734,7 +792,7 @@ fn run_experiment(
     env_lines.sort();
     fs::write(bundle.join("env.txt"), env_lines.join("\n") + "\n")?;
     if let Some(command) = &args.prepare_command {
-        shell_hook(command, &bundle, 0);
+        let _ = shell_hook(command, &bundle, 0);
     }
     let mut detector = StallDetector::from_args(args)?;
     let mut child = spawn(args, &bundle, &command, &extra_env)?;
@@ -756,6 +814,11 @@ fn run_experiment(
     let result;
 
     loop {
+        if cancellation.requested()? {
+            fs::write(bundle.join("cancelled.txt"), "cancellation requested\n")?;
+            result = "cancelled";
+            break;
+        }
         if let Some(status) = child.try_wait()? {
             fs::write(bundle.join("exit-status.txt"), format!("{status}\n"))?;
             result = if status.success() { "exited" } else { "failed" };
@@ -775,7 +838,7 @@ fn run_experiment(
             result = "stall";
             break;
         }
-        thread::sleep(Duration::from_secs(args.poll_seconds));
+        cancellation.wait(args.poll_seconds)?;
     }
 
     // Detach strace (flushing rpctrace.log) before any gdb capture: a process
@@ -800,7 +863,7 @@ fn run_experiment(
             1,
             Duration::from_secs(0),
         );
-        if args.capture_gdb {
+        if result != "cancelled" && args.capture_gdb {
             let capture_pid = args
                 .capture_pattern
                 .as_deref()
@@ -832,13 +895,32 @@ fn run_experiment(
                 )?;
             }
         }
-        if let Some(command) = &args.capture_command {
-            shell_hook(command, &bundle, child.id());
+        if result != "cancelled"
+            && let Some(command) = &args.capture_command
+        {
+            let _ = shell_hook(command, &bundle, child.id());
         }
         if result != "stall" || !args.leave_running_on_stall {
             if let Some(command) = &args.terminate_command {
-                shell_hook(command, &bundle, child.id());
-                fs::write(bundle.join("cleanup-status.txt"), "ran terminate-command\n")?;
+                let status = shell_hook(command, &bundle, child.id())
+                    .context("failed to execute terminate-command")?;
+                if !status.success() {
+                    bail!("terminate-command failed: {status}; owner cleanup is incomplete");
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait()? {
+                        fs::write(
+                            bundle.join("cleanup-status.txt"),
+                            format!("terminate-command completed; child exited: {status}\n"),
+                        )?;
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        bail!("terminate-command returned but the managed child is still running");
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
             } else {
                 fs::write(
                     bundle.join("cleanup-status.txt"),
@@ -850,7 +932,7 @@ fn run_experiment(
     if (result != "stall" || !args.leave_running_on_stall)
         && let Some(command) = &args.cleanup_command
     {
-        shell_hook(command, &bundle, child.id());
+        let _ = shell_hook(command, &bundle, child.id());
     }
     Ok((bundle, result))
 }
