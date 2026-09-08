@@ -102,6 +102,9 @@ struct CommonArgs {
     poll_seconds: u64,
     #[arg(long, value_parser = parse_key_value)]
     env: Vec<(String, String)>,
+    /// Replay captured stdout and stderr after execution for enclosing test runners.
+    #[arg(long)]
+    forward_output: bool,
     #[arg(long)]
     stall_log: Option<PathBuf>,
     #[arg(long)]
@@ -933,6 +936,16 @@ fn run_experiment(
         && let Some(command) = &args.cleanup_command
     {
         let _ = shell_hook(command, &bundle, child.id());
+    }
+    if args.forward_output {
+        std::io::copy(
+            &mut File::open(bundle.join("stdout.log"))?,
+            &mut std::io::stdout().lock(),
+        )?;
+        std::io::copy(
+            &mut File::open(bundle.join("stderr.log"))?,
+            &mut std::io::stderr().lock(),
+        )?;
     }
     Ok((bundle, result))
 }

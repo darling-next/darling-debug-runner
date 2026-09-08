@@ -48,6 +48,11 @@ own safe shutdown mechanism.
 The runner reports a command that exits unsuccessfully as `RESULT=failed` and
 returns a non-zero status without treating it as a stall.
 
+Use `--forward-output` with `run` or `darling` when an enclosing test runner
+needs the command's stdout and stderr, not just bundle/result records. Captured
+streams are replayed to their corresponding output streams after execution and
+cleanup; this is not live streaming. Command failure still returns non-zero.
+
 SIGINT and SIGTERM request cancellation through the runner's normal cleanup
 path and produce `RESULT=cancelled` with a non-zero exit status. Cancellation
 wakes the runner even with a long polling interval and skips GDB/capture hooks
