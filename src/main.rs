@@ -1,3 +1,5 @@
+mod exact;
+
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
@@ -90,6 +92,8 @@ enum RunnerCommand {
 
 #[derive(Args)]
 struct CommonArgs {
+    #[command(flatten)]
+    exact: exact::ExactArgs,
     #[arg(long)]
     name: String,
     #[arg(long, default_value = "~/work/darling-debug")]
@@ -176,6 +180,8 @@ struct DarlingArgs {
 
 #[derive(Args)]
 struct CaptureArgs {
+    #[command(flatten)]
+    exact: exact::ExactArgs,
     #[arg(long, conflicts_with = "pattern")]
     pid: Option<u32>,
     #[arg(long, conflicts_with = "pid")]
@@ -790,7 +796,13 @@ fn run_experiment(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         )
-        .map(|(key, value)| format!("{key}={value}"))
+        .map(|(key, value)| {
+            if args.exact.capture_exact {
+                format!("{key}=<redacted>")
+            } else {
+                format!("{key}={value}")
+            }
+        })
         .collect();
     env_lines.sort();
     fs::write(bundle.join("env.txt"), env_lines.join("\n") + "\n")?;
@@ -854,6 +866,41 @@ fn run_experiment(
         if let Some(stall_log) = &args.stall_log {
             let stall_log = expand_home(stall_log);
             let _ = fs::copy(stall_log, bundle.join("stall-log.txt"));
+        }
+        if result != "cancelled" && args.exact.capture_exact {
+            let selected = match args.capture_pattern.as_deref() {
+                Some(pattern) => find_pid_in_tree(child.id(), pattern),
+                None => Ok(child.id()),
+            };
+            let capture_result = match selected {
+                Ok(pid) => {
+                    let pids = if args.capture_tree {
+                        process_tree(pid)
+                    } else {
+                        vec![pid]
+                    };
+                    exact::capture(&pids, &bundle, &args.exact)
+                }
+                Err(_) if args.exact.capture_prefix.is_some() => {
+                    exact::capture(&[], &bundle, &args.exact)
+                }
+                Err(error) => Err(error),
+            };
+            match capture_result {
+                Ok(complete) => {
+                    let _ = fs::write(
+                        bundle.join("exact-status.txt"),
+                        format!("complete={complete}\n"),
+                    );
+                }
+                Err(error) => {
+                    // Diagnostic failure must never bypass owner termination.
+                    let _ = fs::write(
+                        bundle.join("exact-status.txt"),
+                        format!("incomplete: {error:#}\n"),
+                    );
+                }
+            }
         }
         let _ = capture_process_tree(
             child.id(),
@@ -1020,9 +1067,30 @@ fn main() -> Result<ExitCode> {
             run_experiment(&args.common, command, env)?
         }
         RunnerCommand::Capture(args) => {
-            let pid = find_pid(args.pid, args.pattern.as_deref())?;
+            let pid = if args.exact.capture_prefix.is_some()
+                && args.pid.is_none()
+                && args.pattern.is_none()
+            {
+                None
+            } else {
+                Some(find_pid(args.pid, args.pattern.as_deref())?)
+            };
             let bundle = make_bundle(&args.bundle_root, &args.name)?;
-            if args.tree {
+            let exact_complete = if args.exact.capture_exact {
+                let pids = pid
+                    .map(|pid| {
+                        if args.tree {
+                            process_tree(pid)
+                        } else {
+                            vec![pid]
+                        }
+                    })
+                    .unwrap_or_default();
+                exact::capture(&pids, &bundle, &args.exact)?
+            } else {
+                true
+            };
+            if let Some(pid) = pid.filter(|_| args.tree) {
                 capture_process_tree(
                     pid,
                     &bundle,
@@ -1034,7 +1102,7 @@ fn main() -> Result<ExitCode> {
                     args.snapshots,
                     Duration::from_secs(args.interval_seconds),
                 )?;
-            } else {
+            } else if let Some(pid) = pid {
                 capture_target(
                     pid,
                     &bundle,
@@ -1047,7 +1115,14 @@ fn main() -> Result<ExitCode> {
                     Duration::from_secs(args.interval_seconds),
                 )?;
             }
-            (bundle, "captured")
+            (
+                bundle,
+                if exact_complete {
+                    "captured"
+                } else {
+                    "capture-incomplete"
+                },
+            )
         }
         RunnerCommand::Signal(args) => {
             let pid = find_pid(args.pid, args.pattern.as_deref())?;

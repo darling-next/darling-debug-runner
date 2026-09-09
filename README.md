@@ -63,3 +63,58 @@ failure is reported without falling back to a process-group kill.
 For prefix-backed commands, use `darling` or supply the prefix owner's
 `--terminate-command` explicitly. The generic `run` fallback cannot infer
 dependencies such as guests needing a live RPC server during termination.
+
+## Exact images and cores
+
+Opt in before cleanup or runtime restoration can replace the loaded binaries:
+
+```sh
+target/release/darling-debug-runner capture \
+  --capture-exact --capture-prefix "$DPREFIX" \
+  --exact-timeout-seconds 60 --exact-max-mib 512
+```
+
+`run` and `darling` accept the same flags and capture on timeout or detected
+stall, before termination. Without a prefix, selection uses the existing
+PID/pattern and tree options. Prefix selection also finds detached loaders by
+their retained prefix directory fd, even when the guest cleared its environment.
+It prioritizes guest loaders and refuses to substitute an unrelated process when
+no prefix owner is found. Cancellation does not initiate exact capture.
+
+`exact/manifest.json` indexes per-process maps, fd state, registers in `gdb.txt`,
+Linux ELF cores, and `image-NNNN` files. Each image records its mapped
+device/inode, source method, size, and SHA-256. Images are opened through
+`/proc/PID/map_files`, or the target's namespace root with identity verification;
+a replacement pathname is not accepted as the old mapped object.
+
+The defaults are **60 seconds plus a 2-second kill grace** and **512 MiB total**
+for the exact archive, shared across at most 128 processes. These limits do not
+cover legacy capture hooks, ordinary stdout/stderr, or owner shutdown.
+`exact/status.txt` remains authoritative if capture is interrupted.
+Standalone incomplete capture returns nonzero; `run` retains the payload's
+timeout/stall result. Missing images, storage exhaustion, ptrace denial, and
+core-generation warnings are incomplete, not fallback success. Linux can refuse
+the `vsyscall` page at `0xffffffffff600000`; its actual warning is retained even
+when the resulting core's user stacks and registers are usable.
+
+Exact capture requires noninteractive `sudo`, GNU `timeout`, and Python-enabled
+GDB. Core memory, mapped files, fd paths, and command diagnostics **can contain
+secrets**. Exact mode does not archive an environment blob and redacts values
+in the ordinary `env.txt`; this does not make a core safe to publish.
+
+For offline work, use the archived images, never binaries restored into the
+current prefix. The manifest maps original image paths to archive filenames.
+Mach-O symbolization requires the captured mappings and Mach-O load commands to
+derive the image slide; account for the slice offset of a universal binary.
+Feed the archived image and its link-time address to `llvm-symbolizer`.
+Disable GDB auto-loading and use an empty sysroot for raw core inspection unless
+you have reconstructed a sysroot from the archived images. GDB otherwise may
+silently read today's mapped files instead of the captured versions.
+
+Opt-in Linux regression (real ptrace, deleted/replaced mappings, scrubbed
+prefix-fd ownership, offline core memory, and storage exhaustion):
+
+```sh
+cargo build
+python3 -B tests/exact_capture.py target/debug/darling-debug-runner
+```
