@@ -1,11 +1,56 @@
 # darling-debug-runner
 
 Runs commands in an isolated process group and writes reproducible debug
-bundles. It can detect stalls from log activity, capture `/proc` state and GDB
-backtraces, signal matching processes, and run preparation/capture/cleanup
-hooks.
+bundles. It can enforce a hard deadline or an explicitly configured
+log-pattern inactivity policy, capture `/proc` state and GDB backtraces, signal
+matching processes, and run preparation/capture/cleanup hooks. A `stalled`
+result records that policy firing; log silence alone does not prove a hang.
 
-Build:
+## Darling workspace workflow
+
+For the four supported development scenarios, use the manifest's managed
+entrypoint.
+From the sibling `darling-workspace` directory, configure a context once:
+
+```sh
+mise run dw dev context homebrew --prefix /absolute/path/to/new-prefix
+mise run dw dev run homebrew-prepare
+mise run dw dev run homebrew-preflight
+mise run dw dev run exact-capture
+mise run dw dev run homebrew-source
+```
+
+A new prefix must be absent or empty. The default runtime is
+`homebrew-lz4-source`; the runner is incrementally built in release mode unless
+an explicit `--executor` is selected, and archives default to the workspace
+parent's `darling-debug` directory. `--dry-run` prints the underlying command
+without build, boot, prefix or job creation. `--detach` starts without an
+observer; use the printed `mise run dw dev follow JOB` / `mise run dw dev cancel JOB`
+commands to reconnect or request owner cleanup.
+
+Runner stdout/stderr and Homebrew log directories register automatically with
+the job. Follow streams them and reports phase, paths and last-write age without
+classifying quiet periods as hangs. The manifest's `mise run dw ...` and
+`mise run west ...` proxy tasks select the pinned environment and forward
+arguments unchanged. From the workspace root use
+`mise -C darling-workspace run dw ...` or `run west ...`.
+Execute advanced prefix-backed tests with
+`scripts/west-job.sh start --state-dir DIR -- mise run west test ...`,
+then attach `scripts/west-job.sh follow --state-dir DIR`.
+Never overwrite/delete a live prefix's binaries: use the owning West shutdown
+and deployment transaction, preserving failure evidence.
+
+Each scenario has independent acceptance criteria. Validate SDK identity against
+authoritative package metadata and retain provenance evidence. Do not invent
+version metadata or disable SDK compatibility checks. Record results and
+blockers in Beads and diagnostic archives. See the manifest's
+`docs/test-infra.md` for prerequisite, provenance and acceptance contracts.
+
+## Low-level runner interfaces
+
+The standalone capture/run examples below describe supported advanced APIs;
+they do not replace West's prefix lifecycle ownership. Build manually only
+when using those interfaces outside the managed dev workflow:
 
 ```sh
 cargo build --release
@@ -44,6 +89,11 @@ process group.
 Existing stall logs are followed from their current end, so old events do not
 affect a new run. Use `--terminate-command` with `run` when the target has its
 own safe shutdown mechanism.
+The optional inactivity policy requires `--stall-log`, `--stall-pattern` and
+`--stall-seconds`; `--stall-after-output` can defer arming until a payload
+marker. It measures time without a matching event, not general log growth.
+Keep that configured result distinct from a diagnosed deadlock.
+
 
 The runner reports a command that exits unsuccessfully as `RESULT=failed` and
 returns a non-zero status without treating it as a stall.
@@ -51,10 +101,10 @@ returns a non-zero status without treating it as a stall.
 Use `--forward-output` with `run` or `darling` when an enclosing test runner
 needs the command's stdout and stderr, not just bundle/result records. Captured
 streams are replayed to their corresponding output streams after execution and
-cleanup; this is not live streaming. Command failure still returns non-zero.
+cleanup; this is not live streaming. Command failure returns non-zero.
 
 `BUNDLE=...` is published and flushed when the bundle is created, before the
-target starts; `RESULT=...` remains the completion record. Under `west-job`,
+target starts; `RESULT=...` is the completion record. Under `west-job`,
 the runner atomically registers its stdout/stderr files in the job state so
 the attached observer can stream them without guessing timestamped paths.
 Registration does not change process ownership or cancellation behavior.
@@ -96,12 +146,20 @@ a replacement pathname is not accepted as the old mapped object.
 The defaults are **60 seconds plus a 2-second kill grace** and **512 MiB total**
 for the exact archive, shared across at most 128 processes. These limits do not
 cover legacy capture hooks, ordinary stdout/stderr, or owner shutdown.
-`exact/status.txt` remains authoritative if capture is interrupted.
+`exact/status.txt` is authoritative if capture is interrupted.
 Standalone incomplete capture returns nonzero; `run` retains the payload's
 timeout/stall result. Missing images, storage exhaustion, ptrace denial, and
 core-generation warnings are incomplete, not fallback success. Linux can refuse
 the `vsyscall` page at `0xffffffffff600000`; its actual warning is retained even
 when the resulting core's user stacks and registers are usable.
+
+The workspace's `mise run dw dev run exact-capture` is a guest diagnostic with an
+intentional payload timeout. Its diagnostic PASS requires the readiness marker,
+an identity-hashed guest Mach-O image and structurally complete ELF core for
+the same process, registers and successful prefix cleanup. That oracle can pass
+while the archive reports `exact_complete=false` for an unreadable
+vsyscall mapping. It neither changes standalone incomplete-capture status nor
+makes a normal timed-out payload successful.
 
 Exact capture requires noninteractive `sudo`, GNU `timeout`, and Python-enabled
 GDB. Core memory, mapped files, fd paths, and command diagnostics **can contain
