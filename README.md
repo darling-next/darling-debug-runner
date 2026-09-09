@@ -53,6 +53,12 @@ needs the command's stdout and stderr, not just bundle/result records. Captured
 streams are replayed to their corresponding output streams after execution and
 cleanup; this is not live streaming. Command failure still returns non-zero.
 
+`BUNDLE=...` is published and flushed when the bundle is created, before the
+target starts; `RESULT=...` remains the completion record. Under `west-job`,
+the runner atomically registers its stdout/stderr files in the job state so
+the attached observer can stream them without guessing timestamped paths.
+Registration does not change process ownership or cancellation behavior.
+
 SIGINT and SIGTERM request cancellation through the runner's normal cleanup
 path and produce `RESULT=cancelled` with a non-zero exit status. Cancellation
 wakes the runner even with a long polling interval and skips GDB/capture hooks

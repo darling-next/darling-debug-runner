@@ -10,8 +10,9 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -329,7 +330,42 @@ fn make_bundle(root: &Path, name: &str) -> Result<PathBuf> {
         Utc::now().format("%Y%m%dT%H%M%SZ")
     ));
     fs::create_dir_all(&bundle)?;
+    let bundle = fs::canonicalize(bundle)?;
+    println!("BUNDLE={}", bundle.display());
+    std::io::stdout().flush()?;
     Ok(bundle)
+}
+
+fn register_output_logs(bundle: &Path) -> Result<()> {
+    let Some(state) = std::env::var_os("WEST_JOB_STATE_DIR") else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(state).join("activity-logs.d");
+    fs::create_dir_all(&directory)?;
+    let name = format!(
+        "runner-{}-{}",
+        std::process::id(),
+        Utc::now()
+            .timestamp_nanos_opt()
+            .context("registration timestamp out of range")?
+    );
+    let temporary = directory.join(format!("{name}.tmp"));
+    let published = directory.join(format!("{name}.logs"));
+    let result = (|| -> Result<()> {
+        let mut output = File::create_new(&temporary)?;
+        for name in ["stdout.log", "stderr.log"] {
+            output.write_all(b"file\0")?;
+            output.write_all(bundle.join(name).as_os_str().as_bytes())?;
+            output.write_all(b"\0")?;
+        }
+        drop(output);
+        fs::rename(&temporary, published)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.context("publishing west-job output logs")
 }
 
 fn shell_hook(command: &str, bundle: &Path, pid: u32) -> std::io::Result<std::process::ExitStatus> {
@@ -758,6 +794,7 @@ fn spawn(
     let program = command.first().context("missing command")?;
     let stdout = File::create(bundle.join("stdout.log"))?;
     let stderr = File::create(bundle.join("stderr.log"))?;
+    register_output_logs(bundle)?;
     let mut process = Command::new(program);
     process
         .args(&command[1..])
@@ -1041,7 +1078,7 @@ fn prepare_darling(args: &DarlingArgs) -> Result<()> {
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let (bundle, result) = match cli.command {
+    let (_bundle, result) = match cli.command {
         RunnerCommand::Run(args) => {
             let command = args.common.command.clone();
             run_experiment(&args.common, command, HashMap::new())?
@@ -1140,10 +1177,10 @@ fn main() -> Result<ExitCode> {
             } else {
                 nix::sys::signal::kill(Pid::from_raw(pid as i32), signal)?;
             }
+            println!("BUNDLE=.");
             (PathBuf::from("."), "signaled")
         }
     };
-    println!("BUNDLE={}", bundle.display());
     println!("RESULT={result}");
     if matches!(result, "exited" | "captured" | "signaled") {
         Ok(ExitCode::SUCCESS)

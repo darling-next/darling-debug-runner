@@ -6,6 +6,7 @@ use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 use std::fs::{self, File};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -45,16 +46,18 @@ fn cancellation_waits_for_owner_cleanup_even_with_long_poll_interval() {
         std::env::temp_dir().join(format!("darling-cancel-test-{}", std::process::id()));
     fs::create_dir(&directory).unwrap();
     let ready = directory.join("ready");
+    let output = directory.join("runner-output");
     let binary = std::env::var_os("DARLING_DEBUG_RUNNER_TEST_BINARY")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_darling-debug-runner").into());
     let runner = Command::new(binary)
         .args(["run", "--name", "cancel", "--poll-seconds", "60", "--timeout-seconds", "120"])
         .arg("--bundle-root")
         .arg(&directory)
+        .env("WEST_JOB_STATE_DIR", &directory)
         .args(["--terminate-command", "kill -TERM \"$TARGET_PID\"", "--", "python3", "-c"])
-        .arg("import os,signal,sys,time\ndef stop(signum,frame):\n time.sleep(0.25)\n sys.exit(23)\nsignal.signal(signal.SIGTERM,stop)\nopen(sys.argv[1],'w').write(str(os.getpid()))\ntime.sleep(120)\n")
+        .arg("import os,signal,sys,time\ndef stop(signum,frame):\n time.sleep(0.25)\n sys.exit(23)\nsignal.signal(signal.SIGTERM,stop)\nprint('LIVE_STDOUT',flush=True)\nprint('LIVE_STDERR',file=sys.stderr,flush=True)\nopen(sys.argv[1],'w').write(str(os.getpid()))\ntime.sleep(120)\n")
         .arg(&ready)
-        .stdout(Stdio::null())
+        .stdout(File::create(&output).unwrap())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
@@ -81,6 +84,32 @@ fn cancellation_waits_for_owner_cleanup_even_with_long_poll_interval() {
     let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) as i32 };
     assert!(fd >= 0);
     experiment.target = Some((pid, unsafe { File::from_raw_fd(fd) }));
+    // Consumers can locate and read both live streams before runner completion.
+    assert!(experiment.runner.try_wait().unwrap().is_none());
+    let announcement = fs::read_to_string(&output).unwrap();
+    let bundle = PathBuf::from(announcement.trim().strip_prefix("BUNDLE=").unwrap());
+    assert!(bundle.is_dir());
+    let mut observed = Vec::new();
+    for entry in fs::read_dir(experiment.directory.join("activity-logs.d")).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|value| value == "logs")
+        {
+            let record = fs::read(entry.path()).unwrap();
+            let fields: Vec<_> = record.split(|byte| *byte == 0).collect();
+            assert!(fields.last().unwrap().is_empty());
+            for pair in fields[..fields.len() - 1].chunks_exact(2) {
+                assert_eq!(pair[0], b"file");
+                let path = PathBuf::from(std::ffi::OsString::from_vec(pair[1].to_vec()));
+                assert_eq!(path.parent(), Some(bundle.as_path()));
+                observed.push(fs::read_to_string(path).unwrap());
+            }
+        }
+    }
+    observed.sort();
+    assert_eq!(observed, ["LIVE_STDERR\n", "LIVE_STDOUT\n"]);
     nix::sys::signal::kill(
         Pid::from_raw(experiment.runner.id() as i32),
         nix::sys::signal::Signal::SIGINT,
@@ -112,4 +141,13 @@ fn cancellation_waits_for_owner_cleanup_even_with_long_poll_interval() {
         "runner returned before owner cleanup terminated its child"
     );
     assert!(target[0].revents().unwrap().contains(PollFlags::POLLIN));
+    assert_eq!(
+        fs::read_to_string(&output)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("BUNDLE="))
+            .count(),
+        1,
+        "completion must not duplicate the early bundle publication"
+    );
 }
