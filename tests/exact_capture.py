@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Opt-in Linux integration: python3 tests/exact_capture.py PATH_TO_RUNNER.
 
-Requires a C compiler, Python-enabled GDB, readelf, and noninteractive sudo.
-Exercises real ptrace/core generation; no debugger or procfs mocks.
+Requires a C compiler, Python-enabled GDB, readelf, noninteractive sudo, and
+DWDIAG_WORKSPACE pointing to the companion evidence authority.
+Exercises real ptrace/core generation and verified stored-payload readers.
 """
 import hashlib
 import json
@@ -12,8 +13,12 @@ import select
 import subprocess
 import sys
 import tempfile
+import shutil
 import time
 import uuid
+
+sys.path.insert(0, str(Path(os.environ["DWDIAG_WORKSPACE"]) / "west_commands"))
+from evidence_storage import open_payload
 
 
 FIXTURE = r'''
@@ -88,7 +93,8 @@ def run_case(runner, root, *, memory_mib, budget_mib):
         assert "State:\tT" not in proc_status and "State:\tt" not in proc_status, proc_status
         loaded, = [image for image in record["images"] if image["path"] == str(mapped) + " (deleted)"]
         assert loaded["complete"], loaded
-        archived = (exact / loaded["file"]).read_bytes()
+        with open_payload(exact / loaded["file"]) as payload:
+            archived = payload.read()
         assert archived == original, "captured replacement instead of the mapped inode"
         assert loaded["sha256"] == hashlib.sha256(archived).hexdigest()
         files = [path for path in exact.rglob("*") if path.is_file()]
@@ -100,14 +106,19 @@ def run_case(runner, root, *, memory_mib, budget_mib):
             assert not record["core"]["complete"], record
         else:
             core = exact / record["core"]["file"]
-            subprocess.run(["readelf", "-h", str(core)], check=True, capture_output=True)
-            offline = subprocess.run(
-                ["gdb", "-nx", "-nh", "-q", "-batch", "-iex", "set auto-load off",
-                 "-c", str(core), "-ex", "x/s " + address],
-                capture_output=True, text=True, timeout=10,
-            )
-            assert token in offline.stdout, offline.stdout + offline.stderr
-            assert "rax" in (exact / "gdb.txt").read_text(), "lost register diagnostics"
+            with tempfile.NamedTemporaryFile(dir=root, suffix=".core") as decoded:
+                with open_payload(core) as payload:
+                    shutil.copyfileobj(payload, decoded)
+                decoded.flush()
+                subprocess.run(["readelf", "-h", decoded.name], check=True, capture_output=True)
+                offline = subprocess.run(
+                    ["gdb", "-nx", "-nh", "-q", "-batch", "-iex", "set auto-load off",
+                     "-c", decoded.name, "-ex", "x/s " + address],
+                    capture_output=True, text=True, timeout=10,
+                )
+                assert token in offline.stdout, offline.stdout + offline.stderr
+            with open_payload(exact / "gdb.txt") as payload:
+                assert "rax" in payload.read().decode(), "lost register diagnostics"
         print(f"PASS exact-capture memory={memory_mib}MiB budget={budget_mib}MiB "
               f"complete={manifest['complete']} elapsed={time.monotonic() - before:.2f}s")
     finally:

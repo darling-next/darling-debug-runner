@@ -1,0 +1,43 @@
+/*
+ * The out-of-band futex trace the reader needs, and the reason it must be out-of-band.
+ *
+ * A /proc syscall snapshot is a MOMENT: it says who is waiting now, and never who woke whom. The wake half of a
+ * stall question therefore cannot come from a snapshot at all -- it has to be recorded while the run happens. This
+ * probe records it, one event per line, in the exact schema `dwdiag futex --futex-trace` reads:
+ *
+ *   # BASE wall_s=<seconds> mono_ns=<nanoseconds>
+ *   WAIT pid=<pid> tid=<tid> uaddr=<hex> ts_ns=<ns>
+ *   WAKE pid=<pid> tid=<tid> uaddr=<hex> woke=<n> ts_ns=<ns>
+ *
+ * WHY THE BASE LINE. A kernel probe reports MONOTONIC time (`nsecs`), while a run's window is recorded as wall
+ * clock, and the reader refuses a trace that falls outside that window. Rather than teach the reader to guess the
+ * offset -- which is exactly the guess the window check exists to prevent -- the probe prints both clocks once at
+ * start, and every event is converted from that.
+ *
+ * WHY THE COMMAND MASK. The futex syscall's `op` argument packs a command and flags together: FUTEX_PRIVATE_FLAG is
+ * 0x80 and FUTEX_CLOCK_REALTIME is 0x100. Comparing the raw argument to 0 or 1 would silently drop a private or
+ * realtime wait, which is the common case inside a process, so the command is masked out first.
+ *
+ * RUN:  sudo -n bpftrace -q -e "$(cat probes/futex.bt)" > trace.txt
+ * (or let `dwdiag run --futex-trace-out trace.txt` start and stop it around the workload)
+ */
+
+BEGIN
+{
+	/* Measured on this host: `nsecs` is monotonic nanoseconds since boot (about 1.7e14 here), while
+	 * `strftime("%s", nsecs)` prints the WALL-CLOCK second that matches `date +%s` exactly. So the base carries
+	 * seconds for the run window and monotonic nanoseconds for sub-second ORDERING, which the pairing needs:
+	 * two events in the same second must still be ordered. */
+	printf("# BASE wall_s=%s mono_ns=%llu\n", strftime("%s", nsecs), nsecs);
+}
+
+tracepoint:syscalls:sys_enter_futex
+{
+	$cmd = args->op & 0x7f;
+
+	if ($cmd == 0) {
+		printf("WAIT pid=%d tid=%d uaddr=0x%llx ts_ns=%llu\n", pid, tid, args->uaddr, nsecs);
+	} else if ($cmd == 1) {
+		printf("WAKE pid=%d tid=%d uaddr=0x%llx woke=%lld ts_ns=%llu\n", pid, tid, args->uaddr, args->val, nsecs);
+	}
+}
